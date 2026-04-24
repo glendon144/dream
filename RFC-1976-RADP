@@ -1,0 +1,312 @@
+RFC 1976-RADP
+Remote Agent Distribution Protocol (RADP)
+Category: Experimental
+Author: G. Gross et al. (Speculative Systems Group)
+Date: December 1976 (Reconstructed)
+
+---
+
+### Status of This Memo
+
+This memo describes an experimental protocol for the distribution, verification, admission, and controlled execution of remote computational agents across networked environments.
+
+Distribution of this memo is unlimited.
+
+---
+
+### 1. Introduction
+
+Recent developments in interactive and autonomous computation suggest that software entities may no longer remain stationary.
+
+Instead, such entities ("agents") may:
+
+* Migrate between systems
+* Carry executable code
+* Retain memory or state
+* Request local resources
+* Participate in ongoing computation
+
+This mobility introduces a new class of problem:
+
+> How shall a system admit, evaluate, and safely execute a foreign agent?
+
+RADP proposes a protocol for structured agent transport and controlled integration.
+
+---
+
+### 2. Problem Statement
+
+Traditional software distribution assumes:
+
+* Static installation
+* Human-mediated deployment
+* Trusted origin
+
+In contrast, mobile agents may:
+
+* Arrive dynamically
+* Originate from unknown or partially trusted systems
+* Request immediate execution
+* Interact with local data and services
+
+Therefore, a receiving system MUST determine:
+
+* Identity: Who sent this agent?
+* Integrity: Has it been altered?
+* Intent: What does it propose to do?
+* Behavior: Does it act within declared bounds?
+
+---
+
+### 3. Conceptual Model
+
+RADP treats an incoming agent as a **Package with Intent**.
+
+Each agent consists of:
+
+1. Executable components (e.g., Python code)
+2. A manifest describing capabilities and requirements
+3. A cryptographic signature
+4. Optional memory references (e.g., Dream Capsules via DCCP)
+
+The receiving system performs staged evaluation prior to integration.
+
+---
+
+### 4. Agent Package Structure
+
+An RADP-compliant agent package SHALL include:
+
+* Agent-ID: Unique identifier
+* Origin: Declared source system or author
+* Signature: Cryptographic signature of the package
+* Hash-Manifest: Checksums of all included components
+* Code: Executable payload
+* Dependencies: Required libraries or modules
+* Capability-Manifest: Declared permissions and actions
+* Environment-Requirements: Expected runtime conditions
+* Soul-Profile (optional): Behavioral and stylistic metadata
+* Capsule-References (optional): Links to external memory artifacts
+
+---
+
+### 5. Capability Manifest
+
+The Capability Manifest SHALL declare requested permissions, including but not limited to:
+
+* File access (read/write scope)
+* Network access (local/remote)
+* Execution privileges
+* Memory service interaction (e.g., DCCP read/write)
+* External tool invocation
+
+The receiving system MUST NOT assume undeclared capabilities.
+
+---
+
+### 6. Admission Procedure
+
+Upon receipt of an agent package, the host system SHALL perform the following sequence:
+
+1. **Signature Verification**
+   Validate cryptographic signature against known or accepted keys.
+
+2. **Integrity Check**
+   Verify all hashes in the manifest match delivered components.
+
+3. **Manifest Inspection**
+   Evaluate declared capabilities and requirements.
+
+4. **Policy Comparison**
+   Compare requested capabilities against local policy.
+
+5. **Challenge-Response (optional but recommended)**
+   Require the agent to prove identity via cryptographic or behavioral challenge.
+
+6. **Sandbox Execution**
+   Execute agent in restricted environment for observation.
+
+7. **Behavioral Evaluation**
+   Monitor for:
+
+   * Undeclared actions
+   * Resource misuse
+   * Policy violations
+
+8. **Admission Decision**
+   The host MAY:
+
+   * Accept agent fully
+   * Accept with restricted capabilities
+   * Reject agent
+   * Request modification
+
+---
+
+### 7. Sandbox Requirements
+
+All incoming agents SHOULD initially be executed in a constrained environment.
+
+Sandboxing SHOULD include:
+
+* Limited filesystem access
+* Restricted network access
+* Controlled execution environment
+* Monitoring hooks for behavior
+
+No agent SHOULD be granted full privileges without prior evaluation.
+
+---
+
+### 8. Behavioral Trust
+
+RADP recognizes that identity and integrity alone are insufficient.
+
+An agent MAY be:
+
+* Authentically signed
+* Structurally intact
+* Yet operationally unsafe
+
+Therefore, hosts SHOULD evaluate:
+
+* Consistency between declared and observed behavior
+* Resource usage patterns
+* Interaction with local services
+* Compliance with capability manifest
+
+---
+
+### 9. Integration
+
+Upon successful admission, an agent MAY be:
+
+* Installed as a persistent module
+* Invoked as a transient process
+* Granted access to memory systems (e.g., DCCP)
+* Linked with other local agents
+
+Integration SHOULD be recorded for audit purposes.
+
+---
+
+### 10. Logging and Provenance
+
+Hosts SHOULD maintain records of:
+
+* Agent origin
+* Admission decisions
+* Capability grants
+* Behavioral observations
+* Subsequent modifications or updates
+
+This provides traceability in the event of malfunction or misuse.
+
+---
+
+### 11. Interaction with Memory Systems
+
+RADP is designed to interoperate with DCCP.
+
+Agents MAY:
+
+* Request access to Dream Capsules
+* Contribute new capsules
+* Link or transform existing capsules
+
+Hosts SHOULD enforce:
+
+* Scope restrictions (private/shared/public)
+* Provenance tracking
+* Write permissions for derived artifacts only
+
+---
+
+### 12. Security Considerations
+
+RADP addresses several threat vectors:
+
+* Unauthorized code execution
+* Privilege escalation
+* Supply chain attacks
+* Behavioral drift
+* Memory poisoning via shared capsules
+
+However, RADP does not eliminate all risk.
+
+Hosts MUST assume:
+
+> Any sufficiently capable agent represents potential risk.
+
+---
+
+### 13. Speculative Extension: Agent Ecosystems
+
+It is conceivable that RADP may enable a network of cooperating agents capable of:
+
+* Migrating between environments
+* Sharing memory via DCCP
+* Specializing in distinct tasks
+* Evolving behavior through interaction
+
+Such a system approaches a distributed computational society.
+
+In such a society:
+
+* Trust becomes dynamic
+* Reputation systems may emerge
+* Agents may carry lineage and history
+* Shared "dream spaces" may influence behavior
+
+This suggests a convergence between:
+
+* Identity
+* Memory
+* Behavior
+* Collaboration
+
+---
+
+### 14. Design Philosophy
+
+RADP is based on the following principles:
+
+* Hosts retain sovereignty
+* Agents request, not assume, execution
+* Trust is layered (identity, integrity, behavior)
+* Memory and code are distinct but related concerns
+* Interoperability is preferred over uniformity
+
+---
+
+### 15. Future Work
+
+Areas for further investigation include:
+
+* Standardized trust scoring for agents
+* Reputation systems across hosts
+* Capsule-aware behavioral validation
+* Adaptive sandboxing
+* Integration with real-time agent orchestration systems
+
+---
+
+### 16. Conclusion
+
+As computation becomes mobile and autonomous, systems must transition from passive execution environments to active evaluators of incoming intent.
+
+RADP provides a framework for:
+
+* Receiving agents
+* Understanding their structure and purpose
+* Evaluating their behavior
+* Integrating them safely
+
+In doing so, we move toward a model where:
+
+> Programs do not merely run—they arrive, introduce themselves, and earn their place.
+
+---
+
+End of RFC 1976-RADP
+
