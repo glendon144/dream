@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 
+import base64
 import hashlib
 import hmac
 import json
 import os
+import secrets
 import sqlite3
+import subprocess
+import tempfile
+import urllib.error
+import urllib.request
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -17,8 +23,9 @@ from pydantic import BaseModel, Field, validator
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "dream_capsules.db"
 SCHEMA_PATH = BASE_DIR / "schema.sql"
-PROTOCOL_VERSION = "dccp-1976-0.1"
-BUNDLE_VERSION = "dream-bundle-0.1"
+PROTOCOL_VERSION = "dccp-1976-0.2"
+BUNDLE_VERSION = "dream-bundle-0.2"
+DEFAULT_CHALLENGE_TTL_SECONDS = 600
 
 ALLOWED_CAPSULE_TYPES = {"distill", "transformation", "dream", "weave", "recovery"}
 ALLOWED_RETENTION = {"ephemeral", "normal", "durable", "permanent"}
@@ -26,9 +33,10 @@ ALLOWED_SCOPE = {"private", "shared", "public"}
 ALLOWED_TRUST = {"local", "trusted", "federated", "quarantined", "deprecated"}
 ALLOWED_REVIEW = {"unreviewed", "reviewed", "human-approved"}
 ALLOWED_AGENT_TIERS = {"local", "trusted", "federated", "admin", "quarantined"}
-ALLOWED_AGENT_STATUS = {"active", "restricted", "revoked"}
+ALLOWED_AGENT_STATUS = {"active", "pending", "restricted", "revoked"}
+ALLOWED_SIGNATURE_ALGORITHMS = {"hmac-sha256", "openssl-sha256"}
 
-app = FastAPI(title="Dream Capsule Server", version="0.2.0")
+app = FastAPI(title="Dream Capsule Server", version="0.3.0")
 
 
 def model_dump(model: BaseModel) -> dict[str, Any]:
@@ -68,28 +76,142 @@ def get_signing_secret(key_id: Optional[str]) -> Optional[str]:
     return os.getenv("DREAM_SHARED_SECRET")
 
 
-def sign_value(value: Any, key_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+def get_private_key_path(key_id: Optional[str]) -> Optional[str]:
+    if key_id:
+        env_name = f"DREAM_PRIVATE_KEY_PATH_{key_id.upper()}"
+        value = os.getenv(env_name)
+        if value:
+            return value
+    return os.getenv("DREAM_PRIVATE_KEY_PATH")
+
+
+def get_public_key_path(key_id: Optional[str]) -> Optional[str]:
+    if key_id:
+        env_name = f"DREAM_PUBLIC_KEY_PATH_{key_id.upper()}"
+        value = os.getenv(env_name)
+        if value:
+            return value
+    return os.getenv("DREAM_PUBLIC_KEY_PATH")
+
+
+def run_openssl_sign(payload: bytes, private_key_path: str) -> str:
+    with tempfile.NamedTemporaryFile() as payload_file, tempfile.NamedTemporaryFile() as sig_file:
+        payload_file.write(payload)
+        payload_file.flush()
+        subprocess.run(
+            [
+                "openssl",
+                "dgst",
+                "-sha256",
+                "-sign",
+                private_key_path,
+                "-out",
+                sig_file.name,
+                payload_file.name,
+            ],
+            check=True,
+            capture_output=True,
+        )
+        sig_file.seek(0)
+        return base64.b64encode(sig_file.read()).decode("ascii")
+
+
+def run_openssl_verify(payload: bytes, signature: str, public_key_path: str) -> bool:
+    raw_signature = base64.b64decode(signature.encode("ascii"))
+    with tempfile.NamedTemporaryFile() as payload_file, tempfile.NamedTemporaryFile() as sig_file:
+        payload_file.write(payload)
+        payload_file.flush()
+        sig_file.write(raw_signature)
+        sig_file.flush()
+        result = subprocess.run(
+            [
+                "openssl",
+                "dgst",
+                "-sha256",
+                "-verify",
+                public_key_path,
+                "-signature",
+                sig_file.name,
+                payload_file.name,
+            ],
+            capture_output=True,
+            text=True,
+        )
+    return result.returncode == 0
+
+
+def verify_with_inline_public_key(payload: bytes, signature: str, public_key: str) -> bool:
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8") as key_file:
+        key_file.write(public_key)
+        key_file.flush()
+        return run_openssl_verify(payload, signature, key_file.name)
+
+
+def sign_value(
+    value: Any, key_id: Optional[str]
+) -> tuple[Optional[str], Optional[str]]:
+    payload = stable_json(value).encode("utf-8")
+    private_key_path = get_private_key_path(key_id)
+    if private_key_path:
+        return run_openssl_sign(payload, private_key_path), "openssl-sha256"
+
     secret = get_signing_secret(key_id)
     if not secret:
         return None, None
-    payload = stable_json(value).encode("utf-8")
     digest = hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
     return digest, "hmac-sha256"
 
 
-def verify_signature(value: Any, signature: Optional[str], key_id: Optional[str]) -> bool:
+def verify_signature(
+    value: Any,
+    signature: Optional[str],
+    key_id: Optional[str],
+    *,
+    public_key: Optional[str] = None,
+    signature_algorithm: Optional[str] = None,
+) -> bool:
     if not signature:
         return False
-    expected, _ = sign_value(value, key_id)
-    if not expected:
+
+    payload = stable_json(value).encode("utf-8")
+    algorithm = signature_algorithm or "openssl-sha256"
+
+    if algorithm == "openssl-sha256":
+        if public_key:
+            return verify_with_inline_public_key(payload, signature, public_key)
+        public_key_path = get_public_key_path(key_id)
+        if public_key_path:
+            return run_openssl_verify(payload, signature, public_key_path)
         return False
-    return hmac.compare_digest(expected, signature)
+
+    if algorithm == "hmac-sha256":
+        secret = get_signing_secret(key_id)
+        if not secret:
+            return False
+        expected = hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, signature)
+
+    return False
 
 
 def is_loopback_request(request: Request) -> bool:
     if request.client is None:
         return True
     return request.client.host in {"127.0.0.1", "::1", "localhost"}
+
+
+def parse_dt(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def default_recovery_query(capsule: dict[str, Any]) -> str:
+    pieces = [
+        capsule.get("summary", ""),
+        " ".join(capsule.get("body", {}).get("themes", [])),
+        " ".join(capsule.get("body", {}).get("entities", [])),
+    ]
+    text = " ".join(piece for piece in pieces if piece).strip()
+    return text[:240]
 
 
 class DreamCapsuleBody(BaseModel):
@@ -159,6 +281,7 @@ class SearchIn(BaseModel):
     scope: Optional[str] = None
     source_agent: Optional[str] = None
     trust_level: Optional[str] = None
+    review_status: Optional[str] = None
     limit: int = Field(default=20, ge=1, le=200)
 
 
@@ -175,6 +298,11 @@ class RecoverIn(BaseModel):
     limit: int = Field(default=10, ge=1, le=100)
     scope: Optional[str] = None
     trust_level: Optional[str] = None
+    review_status: Optional[str] = None
+
+
+class HybridRecoverIn(RecoverIn):
+    openbrain_limit: int = Field(default=5, ge=1, le=20)
 
 
 class AgentUpsertIn(BaseModel):
@@ -191,6 +319,65 @@ class AgentUpsertIn(BaseModel):
     @validator("status")
     def validate_status(cls, value: str) -> str:
         return check_choice("status", value, ALLOWED_AGENT_STATUS)
+
+
+class AgentManifestIn(BaseModel):
+    agent_name: str
+    origin: str
+    code_hash: str
+    dependencies: List[str] = Field(default_factory=list)
+    capability_manifest: List[str] = Field(default_factory=list)
+    environment_requirements: Dict[str, Any] = Field(default_factory=dict)
+    soul_profile: Dict[str, Any] = Field(default_factory=dict)
+    capsule_references: List[str] = Field(default_factory=list)
+    public_key: str
+    signature: str
+    signature_algorithm: str = "openssl-sha256"
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    @validator("signature_algorithm")
+    def validate_signature_algorithm(cls, value: str) -> str:
+        return check_choice("signature_algorithm", value, ALLOWED_SIGNATURE_ALGORITHMS)
+
+
+class ChallengeResponseIn(BaseModel):
+    challenge_id: int
+    signature: str
+    signature_algorithm: str = "openssl-sha256"
+
+    @validator("signature_algorithm")
+    def validate_signature_algorithm(cls, value: str) -> str:
+        return check_choice("signature_algorithm", value, ALLOWED_SIGNATURE_ALGORITHMS)
+
+
+class ManifestAdmissionIn(BaseModel):
+    trust_tier: str
+    status: str
+    reviewer: str
+    note: Optional[str] = None
+
+    @validator("trust_tier")
+    def validate_trust_tier(cls, value: str) -> str:
+        return check_choice("trust_tier", value, ALLOWED_AGENT_TIERS)
+
+    @validator("status")
+    def validate_status(cls, value: str) -> str:
+        return check_choice("status", value, ALLOWED_AGENT_STATUS)
+
+
+class ReviewCapsuleIn(BaseModel):
+    trust_level: str
+    review_status: str
+    reviewer: str
+    note: Optional[str] = None
+
+    @validator("trust_level")
+    def validate_trust_level(cls, value: str) -> str:
+        return check_choice("trust_level", value, ALLOWED_TRUST)
+
+    @validator("review_status")
+    def validate_review_status(cls, value: str) -> str:
+        return check_choice("review_status", value, ALLOWED_REVIEW)
 
 
 class CapsuleBundleIn(BaseModel):
@@ -210,7 +397,7 @@ def init_db() -> None:
 def apply_migrations(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "agents", "trust_tier", "TEXT DEFAULT 'local'")
     ensure_column(conn, "agents", "status", "TEXT DEFAULT 'active'")
-    ensure_column(conn, "capsules", "protocol_version", "TEXT DEFAULT 'dccp-1976-0.1'")
+    ensure_column(conn, "capsules", "protocol_version", "TEXT DEFAULT 'dccp-1976-0.2'")
     ensure_column(conn, "capsules", "trust_level", "TEXT DEFAULT 'local'")
     ensure_column(conn, "capsules", "review_status", "TEXT DEFAULT 'unreviewed'")
     ensure_column(conn, "capsules", "signature", "TEXT")
@@ -220,10 +407,61 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "capsules", "origin_capsule_uuid", "TEXT")
     ensure_column(conn, "capsules", "import_bundle_hash", "TEXT")
     conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_manifests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_id INTEGER NOT NULL,
+            origin TEXT NOT NULL,
+            code_hash TEXT NOT NULL,
+            dependencies_json TEXT NOT NULL,
+            capability_manifest_json TEXT NOT NULL,
+            environment_requirements_json TEXT NOT NULL,
+            soul_profile_json TEXT NOT NULL,
+            capsule_references_json TEXT NOT NULL,
+            public_key TEXT NOT NULL,
+            manifest_hash TEXT NOT NULL,
+            signature TEXT NOT NULL,
+            signature_algorithm TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            challenge_verified INTEGER NOT NULL DEFAULT 0,
+            admitted INTEGER NOT NULL DEFAULT 0,
+            admitted_note TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (agent_id) REFERENCES agents(id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_challenges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            manifest_id INTEGER NOT NULL,
+            nonce TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            response_signature TEXT,
+            response_signature_algorithm TEXT,
+            responded_at TEXT,
+            verified INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (manifest_id) REFERENCES agent_manifests(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_capsules_scope_trust ON capsules(scope, trust_level)"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_capsules_origin_uuid ON capsules(origin_capsule_uuid)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_capsules_review_status ON capsules(review_status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_manifests_agent ON agent_manifests(agent_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_challenges_manifest ON agent_challenges(manifest_id)"
     )
 
 
@@ -234,9 +472,7 @@ def ensure_column(
         row[1] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
     }
     if column_name not in columns:
-        conn.execute(
-            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"
-        )
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
 
 
 @contextmanager
@@ -317,29 +553,6 @@ def get_or_create_source(
     return cur.lastrowid
 
 
-def enforce_capsule_write_policy(
-    *,
-    request: Request,
-    scope: str,
-    agent_row: sqlite3.Row,
-    signature_valid: bool,
-) -> None:
-    if agent_row["status"] == "revoked":
-        fail_http(403, "Agent is revoked and may not write capsules")
-    if scope == "private":
-        return
-    if agent_row["trust_tier"] in {"admin", "trusted"}:
-        return
-    if is_loopback_request(request) and agent_row["trust_tier"] in {"local", "federated"}:
-        return
-    if signature_valid and agent_row["trust_tier"] == "federated":
-        return
-    fail_http(
-        403,
-        "Shared or public capsule writes require a trusted agent, loopback-local write, or a verified federated signature",
-    )
-
-
 def build_capsule_record(payload: CapsuleIn) -> dict[str, Any]:
     body_dict = model_dump(payload.body)
     body_text = stable_json(body_dict)
@@ -379,23 +592,145 @@ def serialize_capsule_row(row: sqlite3.Row) -> dict[str, Any]:
     return data
 
 
+def serialize_link_row(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    if data.get("metadata_json"):
+        try:
+            data["metadata_json"] = json.loads(data["metadata_json"])
+        except json.JSONDecodeError:
+            pass
+    return data
+
+
+def resolve_capsule_id_by_uuid(conn: sqlite3.Connection, capsule_uuid: Optional[str]) -> Optional[int]:
+    if not capsule_uuid:
+        return None
+    row = conn.execute(
+        """
+        SELECT id
+        FROM capsules
+        WHERE capsule_uuid = ? OR origin_capsule_uuid = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (capsule_uuid, capsule_uuid),
+    ).fetchone()
+    return row["id"] if row else None
+
+
 def build_bundle(
-    capsule_row: sqlite3.Row, links: list[sqlite3.Row], sign_bundle: bool
+    conn: sqlite3.Connection, capsule_row: sqlite3.Row, sign_bundle: bool
 ) -> dict[str, Any]:
     capsule = serialize_capsule_row(capsule_row)
+    capsule_id = capsule_row["id"]
+    links = conn.execute(
+        """
+        SELECT
+            l.id,
+            l.from_capsule_id,
+            l.to_capsule_id,
+            l.link_type,
+            l.weight,
+            l.metadata_json,
+            l.created_at,
+            cf.capsule_uuid AS from_capsule_uuid,
+            cf.origin_capsule_uuid AS from_origin_capsule_uuid,
+            ct.capsule_uuid AS to_capsule_uuid,
+            ct.origin_capsule_uuid AS to_origin_capsule_uuid
+        FROM capsule_links l
+        LEFT JOIN capsules cf ON cf.id = l.from_capsule_id
+        LEFT JOIN capsules ct ON ct.id = l.to_capsule_id
+        WHERE l.from_capsule_id = ? OR l.to_capsule_id = ?
+        ORDER BY l.id
+        """,
+        (capsule_id, capsule_id),
+    ).fetchall()
     bundle = {
         "bundle_version": BUNDLE_VERSION,
         "exported_at": now_utc(),
         "capsule": capsule,
-        "links": [dict(link) for link in links],
+        "links": [serialize_link_row(link) for link in links],
     }
     if sign_bundle:
-        payload = dict(bundle)
-        signature, algorithm = sign_value(payload, capsule.get("signer_key_id"))
+        verification_payload = dict(bundle)
+        signature, algorithm = sign_value(
+            verification_payload, capsule.get("signer_key_id")
+        )
         if signature and algorithm:
             bundle["signature"] = signature
             bundle["signature_algorithm"] = algorithm
     return bundle
+
+
+def enforce_capsule_write_policy(
+    *,
+    request: Request,
+    scope: str,
+    agent_row: sqlite3.Row,
+    signature_valid: bool,
+) -> None:
+    if agent_row["status"] == "revoked":
+        fail_http(403, "Agent is revoked and may not write capsules")
+    if scope == "private":
+        return
+    if agent_row["trust_tier"] in {"admin", "trusted"}:
+        return
+    if is_loopback_request(request) and agent_row["trust_tier"] in {"local", "federated"}:
+        return
+    if signature_valid and agent_row["trust_tier"] == "federated":
+        return
+    fail_http(
+        403,
+        "Shared or public capsule writes require a trusted agent, loopback-local write, or a verified federated signature",
+    )
+
+
+def openbrain_search(query: str, limit: int) -> list[dict[str, Any]]:
+    endpoint = os.getenv("OPENBRAIN_MCP_URL")
+    if not endpoint:
+        return []
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "search_thoughts",
+            "arguments": {"query": query, "limit": limit},
+        },
+    }
+    request = urllib.request.Request(
+        endpoint,
+        data=stable_json(payload).encode("utf-8"),
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return []
+
+    content = data.get("result", {}).get("content", [])
+    text_parts = [item.get("text", "") for item in content if isinstance(item, dict)]
+    if not text_parts:
+        return []
+    return [{"source": "openbrain", "text": "\n".join(text_parts)}]
+
+
+def build_manifest_payload(payload: AgentManifestIn) -> dict[str, Any]:
+    return {
+        "agent_name": payload.agent_name,
+        "origin": payload.origin,
+        "code_hash": payload.code_hash,
+        "dependencies": payload.dependencies,
+        "capability_manifest": payload.capability_manifest,
+        "environment_requirements": payload.environment_requirements,
+        "soul_profile": payload.soul_profile,
+        "capsule_references": payload.capsule_references,
+        "public_key": payload.public_key,
+        "metadata": payload.metadata,
+    }
 
 
 @app.on_event("startup")
@@ -445,6 +780,242 @@ async def upsert_agent(payload: AgentUpsertIn):
 async def list_agents():
     with db() as conn:
         rows = [dict(row) for row in conn.execute("SELECT * FROM agents ORDER BY name")]
+    return {"ok": True, "results": rows}
+
+
+@app.post("/submit_manifest")
+async def submit_manifest(payload: AgentManifestIn, request: Request):
+    manifest_payload = build_manifest_payload(payload)
+    signature_valid = verify_signature(
+        manifest_payload,
+        payload.signature,
+        key_id=None,
+        public_key=payload.public_key,
+        signature_algorithm=payload.signature_algorithm,
+    )
+    if not signature_valid:
+        fail_http(400, "Manifest signature verification failed")
+
+    manifest_hash = stable_hash(stable_json(manifest_payload))
+
+    with db() as conn:
+        agent_row = get_or_create_agent(
+            conn,
+            payload.agent_name,
+            public_key=payload.public_key,
+            trust_tier="federated",
+            status="pending",
+        )
+        cur = conn.execute(
+            """
+            INSERT INTO agent_manifests (
+                agent_id, origin, code_hash, dependencies_json,
+                capability_manifest_json, environment_requirements_json,
+                soul_profile_json, capsule_references_json, public_key,
+                manifest_hash, signature, signature_algorithm, metadata_json,
+                challenge_verified, admitted
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
+            """,
+            (
+                agent_row["id"],
+                payload.origin,
+                payload.code_hash,
+                stable_json(payload.dependencies),
+                stable_json(payload.capability_manifest),
+                stable_json(payload.environment_requirements),
+                stable_json(payload.soul_profile),
+                stable_json(payload.capsule_references),
+                payload.public_key,
+                manifest_hash,
+                payload.signature,
+                payload.signature_algorithm,
+                stable_json(payload.metadata),
+            ),
+        )
+        manifest_id = cur.lastrowid
+        log_access(
+            conn,
+            agent_row["id"],
+            "submit_manifest",
+            None,
+            request.client.host if request.client else None,
+            {"manifest_id": manifest_id, "origin": payload.origin},
+        )
+    return {"ok": True, "manifest_id": manifest_id, "signature_valid": True}
+
+
+@app.post("/issue_challenge/{manifest_id}")
+async def issue_challenge(manifest_id: int, request: Request):
+    with db() as conn:
+        manifest = conn.execute(
+            "SELECT * FROM agent_manifests WHERE id = ?",
+            (manifest_id,),
+        ).fetchone()
+        if not manifest:
+            fail_http(404, "Manifest not found")
+
+        nonce = secrets.token_urlsafe(32)
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=DEFAULT_CHALLENGE_TTL_SECONDS)).isoformat()
+        cur = conn.execute(
+            """
+            INSERT INTO agent_challenges (manifest_id, nonce, expires_at)
+            VALUES (?, ?, ?)
+            """,
+            (manifest_id, nonce, expires_at),
+        )
+        challenge_id = cur.lastrowid
+        log_access(
+            conn,
+            manifest["agent_id"],
+            "issue_challenge",
+            None,
+            request.client.host if request.client else None,
+            {"manifest_id": manifest_id, "challenge_id": challenge_id},
+        )
+    return {
+        "ok": True,
+        "challenge_id": challenge_id,
+        "nonce": nonce,
+        "expires_at": expires_at,
+    }
+
+
+@app.post("/respond_challenge/{manifest_id}")
+async def respond_challenge(
+    manifest_id: int, payload: ChallengeResponseIn, request: Request
+):
+    with db() as conn:
+        manifest = conn.execute(
+            """
+            SELECT am.*, a.name AS agent_name
+            FROM agent_manifests am
+            JOIN agents a ON a.id = am.agent_id
+            WHERE am.id = ?
+            """,
+            (manifest_id,),
+        ).fetchone()
+        if not manifest:
+            fail_http(404, "Manifest not found")
+
+        challenge = conn.execute(
+            "SELECT * FROM agent_challenges WHERE id = ? AND manifest_id = ?",
+            (payload.challenge_id, manifest_id),
+        ).fetchone()
+        if not challenge:
+            fail_http(404, "Challenge not found")
+
+        if challenge["verified"]:
+            return {"ok": True, "verified": True, "already_verified": True}
+
+        if parse_dt(challenge["expires_at"]) < datetime.now(timezone.utc):
+            fail_http(400, "Challenge has expired")
+
+        challenge_payload = {
+            "manifest_id": manifest_id,
+            "challenge_id": payload.challenge_id,
+            "nonce": challenge["nonce"],
+        }
+        verified = verify_signature(
+            challenge_payload,
+            payload.signature,
+            key_id=None,
+            public_key=manifest["public_key"],
+            signature_algorithm=payload.signature_algorithm,
+        )
+        if not verified:
+            fail_http(400, "Challenge response signature verification failed")
+
+        conn.execute(
+            """
+            UPDATE agent_challenges
+            SET response_signature = ?, response_signature_algorithm = ?,
+                responded_at = ?, verified = 1
+            WHERE id = ?
+            """,
+            (payload.signature, payload.signature_algorithm, now_utc(), payload.challenge_id),
+        )
+        conn.execute(
+            """
+            UPDATE agent_manifests
+            SET challenge_verified = 1, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (manifest_id,),
+        )
+        conn.execute(
+            """
+            UPDATE agents
+            SET status = CASE WHEN status = 'pending' THEN 'restricted' ELSE status END
+            WHERE id = ?
+            """,
+            (manifest["agent_id"],),
+        )
+        log_access(
+            conn,
+            manifest["agent_id"],
+            "respond_challenge",
+            None,
+            request.client.host if request.client else None,
+            {"manifest_id": manifest_id, "challenge_id": payload.challenge_id},
+        )
+    return {"ok": True, "verified": True}
+
+
+@app.post("/admit_manifest/{manifest_id}")
+async def admit_manifest(manifest_id: int, payload: ManifestAdmissionIn, request: Request):
+    with db() as conn:
+        manifest = conn.execute(
+            "SELECT * FROM agent_manifests WHERE id = ?",
+            (manifest_id,),
+        ).fetchone()
+        if not manifest:
+            fail_http(404, "Manifest not found")
+        if not manifest["challenge_verified"]:
+            fail_http(400, "Manifest has not passed challenge verification")
+
+        conn.execute(
+            """
+            UPDATE agents
+            SET trust_tier = ?, status = ?
+            WHERE id = ?
+            """,
+            (payload.trust_tier, payload.status, manifest["agent_id"]),
+        )
+        conn.execute(
+            """
+            UPDATE agent_manifests
+            SET admitted = 1, admitted_note = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (stable_json({"reviewer": payload.reviewer, "note": payload.note or ""}), manifest_id),
+        )
+        log_access(
+            conn,
+            manifest["agent_id"],
+            "admit_manifest",
+            None,
+            request.client.host if request.client else None,
+            model_dump(payload),
+        )
+    return {"ok": True}
+
+
+@app.get("/list_manifests")
+async def list_manifests():
+    with db() as conn:
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT am.id, a.name AS agent_name, am.origin, am.code_hash,
+                       am.challenge_verified, am.admitted, am.created_at, am.updated_at
+                FROM agent_manifests am
+                JOIN agents a ON a.id = am.agent_id
+                ORDER BY am.created_at DESC
+                """
+            ).fetchall()
+        ]
     return {"ok": True, "results": rows}
 
 
@@ -526,6 +1097,65 @@ async def store_capsule(payload: CapsuleIn, request: Request):
     return {"ok": True, "capsule_id": capsule_id, "capsule_uuid": capsule_uuid}
 
 
+@app.post("/review_capsule/{capsule_id}")
+async def review_capsule(capsule_id: int, payload: ReviewCapsuleIn, request: Request):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT metadata_json FROM capsules WHERE id = ?",
+            (capsule_id,),
+        ).fetchone()
+        if not row:
+            fail_http(404, "Capsule not found")
+
+        metadata = {}
+        if row["metadata_json"]:
+            try:
+                metadata = json.loads(row["metadata_json"])
+            except json.JSONDecodeError:
+                metadata = {}
+        review_log = metadata.setdefault("review_log", [])
+        review_log.append(
+            {
+                "reviewed_at": now_utc(),
+                "reviewer": payload.reviewer,
+                "trust_level": payload.trust_level,
+                "review_status": payload.review_status,
+                "note": payload.note or "",
+            }
+        )
+        conn.execute(
+            """
+            UPDATE capsules
+            SET trust_level = ?, review_status = ?, metadata_json = ?
+            WHERE id = ?
+            """,
+            (payload.trust_level, payload.review_status, stable_json(metadata), capsule_id),
+        )
+        log_access(
+            conn,
+            None,
+            "review_capsule",
+            capsule_id,
+            request.client.host if request.client else None,
+            model_dump(payload),
+        )
+    return {"ok": True}
+
+
+@app.post("/quarantine_capsule/{capsule_id}")
+async def quarantine_capsule(capsule_id: int, reviewer: str, request: Request):
+    return await review_capsule(
+        capsule_id,
+        ReviewCapsuleIn(
+            trust_level="quarantined",
+            review_status="reviewed",
+            reviewer=reviewer,
+            note="Capsule quarantined",
+        ),
+        request,
+    )
+
+
 @app.post("/import_capsule_bundle")
 async def import_capsule_bundle(payload: CapsuleBundleIn, request: Request):
     bundle = payload.bundle
@@ -566,7 +1196,6 @@ async def import_capsule_bundle(payload: CapsuleBundleIn, request: Request):
     if record["content_hash"] != capsule.get("content_hash"):
         fail_http(400, "Bundle content_hash does not match the capsule body")
 
-    signer_key_id = capsule.get("signer_key_id")
     verification_payload = {
         "bundle_version": bundle["bundle_version"],
         "exported_at": bundle.get("exported_at"),
@@ -574,7 +1203,10 @@ async def import_capsule_bundle(payload: CapsuleBundleIn, request: Request):
         "links": bundle.get("links", []),
     }
     signature_valid = verify_signature(
-        verification_payload, bundle.get("signature"), signer_key_id
+        verification_payload,
+        bundle.get("signature"),
+        capsule.get("signer_key_id"),
+        signature_algorithm=bundle.get("signature_algorithm"),
     )
     bundle_hash = stable_hash(stable_json(verification_payload))
 
@@ -593,7 +1225,7 @@ async def import_capsule_bundle(payload: CapsuleBundleIn, request: Request):
             conn,
             capsule_model.source_agent,
             trust_tier="federated" if signature_valid else "quarantined",
-            status="active",
+            status="restricted" if signature_valid else "pending",
         )
         enforce_capsule_write_policy(
             request=request,
@@ -604,6 +1236,9 @@ async def import_capsule_bundle(payload: CapsuleBundleIn, request: Request):
         source_id = get_or_create_source(
             conn, capsule_model.source_type, capsule_model.source_ref, record["content_hash"]
         )
+
+        metadata = capsule_model.metadata or {}
+        unresolved_links: List[dict[str, Any]] = []
         cur = conn.execute(
             """
             INSERT INTO capsules (
@@ -624,16 +1259,16 @@ async def import_capsule_bundle(payload: CapsuleBundleIn, request: Request):
                 capsule_model.confidence,
                 capsule_model.retention,
                 capsule_model.scope,
-                capsule_model.trust_level,
+                "federated" if signature_valid else "quarantined",
                 "reviewed" if signature_valid else "unreviewed",
                 agent_row["id"],
                 source_id,
                 stable_json(capsule_model.lineage or {}),
-                stable_json(capsule_model.metadata or {}),
+                stable_json(metadata),
                 record["content_hash"],
                 capsule.get("signature"),
                 capsule.get("signature_algorithm"),
-                signer_key_id,
+                capsule.get("signer_key_id"),
                 capsule.get("signed_at"),
                 capsule.get("capsule_uuid"),
                 bundle_hash,
@@ -642,18 +1277,45 @@ async def import_capsule_bundle(payload: CapsuleBundleIn, request: Request):
         capsule_id = cur.lastrowid
 
         for link in bundle.get("links", []):
+            from_uuid = link.get("from_origin_capsule_uuid") or link.get("from_capsule_uuid")
+            to_uuid = link.get("to_origin_capsule_uuid") or link.get("to_capsule_uuid")
+            from_local = resolve_capsule_id_by_uuid(conn, from_uuid)
+            to_local = resolve_capsule_id_by_uuid(conn, to_uuid)
+            if from_local and to_local:
+                conn.execute(
+                    """
+                    INSERT INTO capsule_links (from_capsule_id, to_capsule_id, link_type, weight, metadata_json)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        from_local,
+                        to_local,
+                        link.get("link_type", "imported_link"),
+                        link.get("weight", 1.0),
+                        stable_json(
+                            {
+                                "imported": True,
+                                "original_link_id": link.get("id"),
+                                "source_bundle_hash": bundle_hash,
+                            }
+                        ),
+                    ),
+                )
+            else:
+                unresolved_links.append(link)
+
+        if unresolved_links:
+            row = conn.execute(
+                "SELECT metadata_json FROM capsules WHERE id = ?",
+                (capsule_id,),
+            ).fetchone()
+            capsule_metadata = {}
+            if row and row["metadata_json"]:
+                capsule_metadata = json.loads(row["metadata_json"])
+            capsule_metadata["unresolved_external_links"] = unresolved_links
             conn.execute(
-                """
-                INSERT INTO capsule_links (from_capsule_id, to_capsule_id, link_type, weight, metadata_json)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    capsule_id,
-                    capsule_id,
-                    link.get("link_type", "imported_link"),
-                    link.get("weight", 1.0),
-                    stable_json({"imported": True, "original": link}),
-                ),
+                "UPDATE capsules SET metadata_json = ? WHERE id = ?",
+                (stable_json(capsule_metadata), capsule_id),
             )
 
         log_access(
@@ -662,10 +1324,19 @@ async def import_capsule_bundle(payload: CapsuleBundleIn, request: Request):
             "import_bundle",
             capsule_id,
             request.client.host if request.client else None,
-            {"bundle_version": bundle["bundle_version"], "signature_valid": signature_valid},
+            {
+                "bundle_version": bundle["bundle_version"],
+                "signature_valid": signature_valid,
+                "unresolved_links": len(unresolved_links),
+            },
         )
 
-    return {"ok": True, "capsule_id": capsule_id, "signature_valid": signature_valid}
+    return {
+        "ok": True,
+        "capsule_id": capsule_id,
+        "signature_valid": signature_valid,
+        "unresolved_links": len(unresolved_links),
+    }
 
 
 @app.get("/export_capsule/{capsule_id}")
@@ -682,17 +1353,7 @@ async def export_capsule(capsule_id: int, sign_bundle: bool = True):
         ).fetchone()
         if not capsule:
             fail_http(404, "Capsule not found")
-
-        links = conn.execute(
-            """
-            SELECT id, from_capsule_id, to_capsule_id, link_type, weight, metadata_json, created_at
-            FROM capsule_links
-            WHERE from_capsule_id = ? OR to_capsule_id = ?
-            ORDER BY id
-            """,
-            (capsule_id, capsule_id),
-        ).fetchall()
-        return {"ok": True, "bundle": build_bundle(capsule, links, sign_bundle)}
+        return {"ok": True, "bundle": build_bundle(conn, capsule, sign_bundle)}
 
 
 @app.get("/get_capsule/{capsule_id}")
@@ -747,6 +1408,9 @@ async def search_capsules(payload: SearchIn, request: Request):
     if payload.trust_level:
         sql += " AND c.trust_level = ?"
         params.append(payload.trust_level)
+    if payload.review_status:
+        sql += " AND c.review_status = ?"
+        params.append(payload.review_status)
     sql += " ORDER BY c.created_at DESC LIMIT ?"
     params.append(payload.limit)
 
@@ -793,7 +1457,7 @@ async def link_capsules(payload: LinkIn, request: Request):
 @app.post("/recover_context")
 async def recover_context(payload: RecoverIn, request: Request):
     sql = """
-        SELECT id, capsule_uuid, capsule_type, summary, confidence, scope, trust_level, created_at
+        SELECT id, capsule_uuid, capsule_type, summary, confidence, scope, trust_level, review_status, created_at
         FROM capsules
         WHERE (summary LIKE ? OR body LIKE ?)
     """
@@ -804,6 +1468,9 @@ async def recover_context(payload: RecoverIn, request: Request):
     if payload.trust_level:
         sql += " AND trust_level = ?"
         params.append(payload.trust_level)
+    if payload.review_status:
+        sql += " AND review_status = ?"
+        params.append(payload.review_status)
     sql += " ORDER BY confidence DESC, created_at DESC LIMIT ?"
     params.append(payload.limit)
 
@@ -818,6 +1485,26 @@ async def recover_context(payload: RecoverIn, request: Request):
             model_dump(payload),
         )
     return {"ok": True, "recovered": rows}
+
+
+@app.post("/recover_hybrid_context")
+async def recover_hybrid_context(payload: HybridRecoverIn, request: Request):
+    local_result = await recover_context(
+        RecoverIn(
+            query=payload.query,
+            limit=payload.limit,
+            scope=payload.scope,
+            trust_level=payload.trust_level,
+            review_status=payload.review_status,
+        ),
+        request,
+    )
+    openbrain_results = openbrain_search(payload.query, payload.openbrain_limit)
+    return {
+        "ok": True,
+        "recovered": local_result["recovered"],
+        "openbrain": openbrain_results,
+    }
 
 
 @app.get("/list_recent_capsules")
@@ -852,6 +1539,7 @@ async def root():
         "docs": "/docs",
         "recent": "/list_recent_capsules",
         "agents": "/list_agents",
+        "manifests": "/list_manifests",
     }
 
 
@@ -883,10 +1571,21 @@ async def ancestry(capsule_id: int):
 
         links = conn.execute(
             """
-            SELECT id, from_capsule_id, to_capsule_id, link_type, weight, metadata_json, created_at
-            FROM capsule_links
-            WHERE from_capsule_id = ? OR to_capsule_id = ?
-            ORDER BY id
+            SELECT
+                l.id,
+                l.from_capsule_id,
+                l.to_capsule_id,
+                l.link_type,
+                l.weight,
+                l.metadata_json,
+                l.created_at,
+                cf.capsule_uuid AS from_capsule_uuid,
+                ct.capsule_uuid AS to_capsule_uuid
+            FROM capsule_links l
+            LEFT JOIN capsules cf ON cf.id = l.from_capsule_id
+            LEFT JOIN capsules ct ON ct.id = l.to_capsule_id
+            WHERE l.from_capsule_id = ? OR l.to_capsule_id = ?
+            ORDER BY l.id
             """,
             (capsule_id, capsule_id),
         ).fetchall()
@@ -895,5 +1594,5 @@ async def ancestry(capsule_id: int):
             "ok": True,
             "capsule": dict(capsule),
             "parent": dict(parent) if parent else None,
-            "links": [dict(row) for row in links],
+            "links": [serialize_link_row(row) for row in links],
         }

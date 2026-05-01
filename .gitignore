@@ -1,2 +1,5 @@
 __pycache__/
 dream_capsules.db
+dream_capsules.db-*
+*.log
+*.pid
