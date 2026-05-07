@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS capsules (
     signed_at TEXT,
     origin_capsule_uuid TEXT,
     import_bundle_hash TEXT,
+    ttl_seconds INTEGER,              -- optional TTL in seconds from ingestion time
+    expires_at TEXT,                  -- computed UTC expiry timestamp; NULL means retain indefinitely
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (source_agent_id) REFERENCES agents(id),
     FOREIGN KEY (source_id) REFERENCES sources(id),
@@ -77,6 +79,7 @@ CREATE TABLE IF NOT EXISTS access_log (
 CREATE INDEX IF NOT EXISTS idx_capsules_type ON capsules(capsule_type);
 CREATE INDEX IF NOT EXISTS idx_capsules_created_at ON capsules(created_at);
 CREATE INDEX IF NOT EXISTS idx_capsules_agent ON capsules(source_agent_id);
+CREATE INDEX IF NOT EXISTS idx_capsules_expires_at ON capsules(expires_at);
 CREATE INDEX IF NOT EXISTS idx_capsule_links_from ON capsule_links(from_capsule_id);
 CREATE INDEX IF NOT EXISTS idx_capsule_links_to ON capsule_links(to_capsule_id);
 CREATE INDEX IF NOT EXISTS idx_access_log_agent ON access_log(agent_id);

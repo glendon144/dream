@@ -140,7 +140,9 @@ def run_openssl_verify(payload: bytes, signature: str, public_key_path: str) -> 
     return result.returncode == 0
 
 
-def verify_with_inline_public_key(payload: bytes, signature: str, public_key: str) -> bool:
+def verify_with_inline_public_key(
+    payload: bytes, signature: str, public_key: str
+) -> bool:
     with tempfile.NamedTemporaryFile("w", encoding="utf-8") as key_file:
         key_file.write(public_key)
         key_file.flush()
@@ -204,6 +206,12 @@ def parse_dt(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def compute_capsule_expiry(ttl_seconds: Optional[int]) -> Optional[str]:
+    if ttl_seconds is None:
+        return None
+    return (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
+
+
 def default_recovery_query(capsule: dict[str, Any]) -> str:
     pieces = [
         capsule.get("summary", ""),
@@ -239,6 +247,7 @@ class CapsuleIn(BaseModel):
     scope: str = "private"
     trust_level: str = "local"
     review_status: str = "unreviewed"
+    ttl_seconds: Optional[int] = Field(default=None, ge=1)
     source_agent: str
     source_type: Optional[str] = None
     source_ref: Optional[str] = None
@@ -406,6 +415,8 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "capsules", "signed_at", "TEXT")
     ensure_column(conn, "capsules", "origin_capsule_uuid", "TEXT")
     ensure_column(conn, "capsules", "import_bundle_hash", "TEXT")
+    ensure_column(conn, "capsules", "ttl_seconds", "INTEGER")
+    ensure_column(conn, "capsules", "expires_at", "TEXT")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS agent_manifests (
@@ -456,6 +467,9 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_capsules_review_status ON capsules(review_status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_capsules_expires_at ON capsules(expires_at)"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_agent_manifests_agent ON agent_manifests(agent_id)"
@@ -602,7 +616,9 @@ def serialize_link_row(row: sqlite3.Row) -> dict[str, Any]:
     return data
 
 
-def resolve_capsule_id_by_uuid(conn: sqlite3.Connection, capsule_uuid: Optional[str]) -> Optional[int]:
+def resolve_capsule_id_by_uuid(
+    conn: sqlite3.Connection, capsule_uuid: Optional[str]
+) -> Optional[int]:
     if not capsule_uuid:
         return None
     row = conn.execute(
@@ -675,7 +691,10 @@ def enforce_capsule_write_policy(
         return
     if agent_row["trust_tier"] in {"admin", "trusted"}:
         return
-    if is_loopback_request(request) and agent_row["trust_tier"] in {"local", "federated"}:
+    if is_loopback_request(request) and agent_row["trust_tier"] in {
+        "local",
+        "federated",
+    }:
         return
     if signature_valid and agent_row["trust_tier"] == "federated":
         return
@@ -856,7 +875,10 @@ async def issue_challenge(manifest_id: int, request: Request):
             fail_http(404, "Manifest not found")
 
         nonce = secrets.token_urlsafe(32)
-        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=DEFAULT_CHALLENGE_TTL_SECONDS)).isoformat()
+        expires_at = (
+            datetime.now(timezone.utc)
+            + timedelta(seconds=DEFAULT_CHALLENGE_TTL_SECONDS)
+        ).isoformat()
         cur = conn.execute(
             """
             INSERT INTO agent_challenges (manifest_id, nonce, expires_at)
@@ -933,7 +955,12 @@ async def respond_challenge(
                 responded_at = ?, verified = 1
             WHERE id = ?
             """,
-            (payload.signature, payload.signature_algorithm, now_utc(), payload.challenge_id),
+            (
+                payload.signature,
+                payload.signature_algorithm,
+                now_utc(),
+                payload.challenge_id,
+            ),
         )
         conn.execute(
             """
@@ -963,7 +990,9 @@ async def respond_challenge(
 
 
 @app.post("/admit_manifest/{manifest_id}")
-async def admit_manifest(manifest_id: int, payload: ManifestAdmissionIn, request: Request):
+async def admit_manifest(
+    manifest_id: int, payload: ManifestAdmissionIn, request: Request
+):
     with db() as conn:
         manifest = conn.execute(
             "SELECT * FROM agent_manifests WHERE id = ?",
@@ -988,7 +1017,10 @@ async def admit_manifest(manifest_id: int, payload: ManifestAdmissionIn, request
             SET admitted = 1, admitted_note = ?, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
-            (stable_json({"reviewer": payload.reviewer, "note": payload.note or ""}), manifest_id),
+            (
+                stable_json({"reviewer": payload.reviewer, "note": payload.note or ""}),
+                manifest_id,
+            ),
         )
         log_access(
             conn,
@@ -1023,6 +1055,7 @@ async def list_manifests():
 async def store_capsule(payload: CapsuleIn, request: Request):
     record = build_capsule_record(payload)
     capsule_uuid = str(uuid.uuid4())
+    expires_at = compute_capsule_expiry(payload.ttl_seconds)
     signature, signature_algorithm, signer_key_id = sign_capsule_record(
         record, payload.signing_key_id
     )
@@ -1045,10 +1078,10 @@ async def store_capsule(payload: CapsuleIn, request: Request):
                 capsule_uuid, protocol_version, capsule_type, summary, body,
                 confidence, retention, scope, trust_level, review_status,
                 source_agent_id, source_id, parent_capsule_id, supersedes_capsule_id,
-                lineage_json, metadata_json, content_hash, signature,
+                lineage_json, metadata_json, content_hash, ttl_seconds, expires_at, signature,
                 signature_algorithm, signer_key_id, signed_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 capsule_uuid,
@@ -1068,6 +1101,8 @@ async def store_capsule(payload: CapsuleIn, request: Request):
                 stable_json(payload.lineage or {}),
                 stable_json(payload.metadata or {}),
                 record["content_hash"],
+                payload.ttl_seconds,
+                expires_at,
                 signature,
                 signature_algorithm,
                 signer_key_id,
@@ -1129,7 +1164,12 @@ async def review_capsule(capsule_id: int, payload: ReviewCapsuleIn, request: Req
             SET trust_level = ?, review_status = ?, metadata_json = ?
             WHERE id = ?
             """,
-            (payload.trust_level, payload.review_status, stable_json(metadata), capsule_id),
+            (
+                payload.trust_level,
+                payload.review_status,
+                stable_json(metadata),
+                capsule_id,
+            ),
         )
         log_access(
             conn,
@@ -1182,7 +1222,10 @@ async def import_capsule_bundle(payload: CapsuleBundleIn, request: Request):
             scope=capsule.get("scope", "private"),
             trust_level=capsule.get("trust_level", "federated"),
             review_status=capsule.get("review_status", "unreviewed"),
-            source_agent=payload.source_agent or capsule.get("agent_name") or "imported-agent",
+            ttl_seconds=capsule.get("ttl_seconds"),
+            source_agent=payload.source_agent
+            or capsule.get("agent_name")
+            or "imported-agent",
             source_type="bundle",
             source_ref=capsule.get("capsule_uuid"),
             lineage=capsule.get("lineage_json") or {},
@@ -1234,7 +1277,10 @@ async def import_capsule_bundle(payload: CapsuleBundleIn, request: Request):
             signature_valid=signature_valid,
         )
         source_id = get_or_create_source(
-            conn, capsule_model.source_type, capsule_model.source_ref, record["content_hash"]
+            conn,
+            capsule_model.source_type,
+            capsule_model.source_ref,
+            record["content_hash"],
         )
 
         metadata = capsule_model.metadata or {}
@@ -1245,10 +1291,10 @@ async def import_capsule_bundle(payload: CapsuleBundleIn, request: Request):
                 capsule_uuid, protocol_version, capsule_type, summary, body,
                 confidence, retention, scope, trust_level, review_status,
                 source_agent_id, source_id, lineage_json, metadata_json,
-                content_hash, signature, signature_algorithm, signer_key_id,
+                content_hash, ttl_seconds, expires_at, signature, signature_algorithm, signer_key_id,
                 signed_at, origin_capsule_uuid, import_bundle_hash
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(uuid.uuid4()),
@@ -1266,6 +1312,8 @@ async def import_capsule_bundle(payload: CapsuleBundleIn, request: Request):
                 stable_json(capsule_model.lineage or {}),
                 stable_json(metadata),
                 record["content_hash"],
+                capsule_model.ttl_seconds,
+                capsule.get("expires_at") or compute_capsule_expiry(capsule_model.ttl_seconds),
                 capsule.get("signature"),
                 capsule.get("signature_algorithm"),
                 capsule.get("signer_key_id"),
@@ -1277,7 +1325,9 @@ async def import_capsule_bundle(payload: CapsuleBundleIn, request: Request):
         capsule_id = cur.lastrowid
 
         for link in bundle.get("links", []):
-            from_uuid = link.get("from_origin_capsule_uuid") or link.get("from_capsule_uuid")
+            from_uuid = link.get("from_origin_capsule_uuid") or link.get(
+                "from_capsule_uuid"
+            )
             to_uuid = link.get("to_origin_capsule_uuid") or link.get("to_capsule_uuid")
             from_local = resolve_capsule_id_by_uuid(conn, from_uuid)
             to_local = resolve_capsule_id_by_uuid(conn, to_uuid)
@@ -1457,21 +1507,24 @@ async def link_capsules(payload: LinkIn, request: Request):
 @app.post("/recover_context")
 async def recover_context(payload: RecoverIn, request: Request):
     sql = """
-        SELECT id, capsule_uuid, capsule_type, summary, confidence, scope, trust_level, review_status, created_at
-        FROM capsules
-        WHERE (summary LIKE ? OR body LIKE ?)
+        SELECT c.id, c.capsule_uuid, c.capsule_type, c.summary,
+               c.confidence, c.scope, c.trust_level, c.review_status,
+               c.created_at, a.name AS agent_name
+        FROM capsules c
+        LEFT JOIN agents a ON a.id = c.source_agent_id
+        WHERE (c.summary LIKE ? OR c.body LIKE ?)
     """
     params: List[Any] = [f"%{payload.query}%", f"%{payload.query}%"]
     if payload.scope:
-        sql += " AND scope = ?"
+        sql += " AND c.scope = ?"
         params.append(payload.scope)
     if payload.trust_level:
-        sql += " AND trust_level = ?"
+        sql += " AND c.trust_level = ?"
         params.append(payload.trust_level)
     if payload.review_status:
-        sql += " AND review_status = ?"
+        sql += " AND c.review_status = ?"
         params.append(payload.review_status)
-    sql += " ORDER BY confidence DESC, created_at DESC LIMIT ?"
+    sql += " ORDER BY c.confidence DESC, c.created_at DESC LIMIT ?"
     params.append(payload.limit)
 
     with db() as conn:
