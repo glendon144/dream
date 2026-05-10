@@ -50,6 +50,8 @@ DREAM_TRANSPORT = os.getenv("DREAM_TRANSPORT", "stdio")   # "stdio" or "sse"
 DREAM_SSE_HOST  = os.getenv("DREAM_SSE_HOST", "127.0.0.1")
 DREAM_SSE_PORT  = int(os.getenv("DREAM_SSE_PORT", "8001"))
 DREAM_AGENT     = os.getenv("DREAM_AGENT_NAME", "claude-mcp")
+DREAM_API_TOKEN = os.getenv("DREAM_API_TOKEN")
+DREAM_ADMIN_TOKEN = os.getenv("DREAM_ADMIN_TOKEN")
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("dream_mcp")
@@ -58,19 +60,32 @@ log = logging.getLogger("dream_mcp")
 # HTTP helpers
 # ---------------------------------------------------------------------------
 
-def _client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(base_url=DREAM_BASE_URL, timeout=15.0)
+def _auth_headers(*, admin: bool = False) -> dict[str, str]:
+    token = DREAM_ADMIN_TOKEN if admin and DREAM_ADMIN_TOKEN else DREAM_API_TOKEN
+    if admin and not token:
+        token = DREAM_API_TOKEN
+    if not token:
+        return {}
+    return {"Authorization": f"Bearer {token}"}
 
 
-async def _get(path: str, **params) -> dict:
-    async with _client() as c:
+def _client(*, admin: bool = False) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        base_url=DREAM_BASE_URL,
+        timeout=15.0,
+        headers=_auth_headers(admin=admin),
+    )
+
+
+async def _get(path: str, *, admin: bool = False, **params) -> dict:
+    async with _client(admin=admin) as c:
         r = await c.get(path, params={k: v for k, v in params.items() if v is not None})
         r.raise_for_status()
         return r.json()
 
 
-async def _post(path: str, body: dict) -> dict:
-    async with _client() as c:
+async def _post(path: str, body: dict, *, admin: bool = False) -> dict:
+    async with _client(admin=admin) as c:
         r = await c.post(path, json=body)
         r.raise_for_status()
         return r.json()
@@ -341,7 +356,7 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
 
         # ── dream_list_agents ──────────────────────────────────────────────
         elif name == "dream_list_agents":
-            data = await _get("/list_agents")
+            data = await _get("/list_agents", admin=True)
             return _ok(data)
 
         # ── dream_upsert_agent ─────────────────────────────────────────────
@@ -353,7 +368,7 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
                 "status":     arguments.get("status", "active"),
                 "public_key": arguments.get("public_key"),
             }
-            data = await _post("/upsert_agent", payload)
+            data = await _post("/upsert_agent", payload, admin=True)
             return _ok(data)
 
         # ── dream_server_status ────────────────────────────────────────────
@@ -484,6 +499,8 @@ if __name__ == "__main__":
 # DREAM_SSE_HOST    Bind host for SSE transport (default: 127.0.0.1). Use 0.0.0.0 only when you intentionally need remote reachability.
 # DREAM_SSE_PORT    Port for SSE transport (default: 8001)
 # DREAM_AGENT_NAME  Default agent name for stored capsules (default: claude-mcp)
+# DREAM_API_TOKEN   Bearer token for normal Dream REST access.
+# DREAM_ADMIN_TOKEN Bearer token for admin Dream REST access; falls back to DREAM_API_TOKEN when unset.
 #
 # MAKING IT PERMANENT
 # ------------------------------------

@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field, validator
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -37,6 +37,52 @@ ALLOWED_AGENT_STATUS = {"active", "pending", "restricted", "revoked"}
 ALLOWED_SIGNATURE_ALGORITHMS = {"hmac-sha256", "openssl-sha256"}
 
 app = FastAPI(title="Dream Capsule Server", version="0.3.0")
+
+
+DREAM_API_TOKEN = os.getenv("DREAM_API_TOKEN")
+DREAM_ADMIN_TOKEN = os.getenv("DREAM_ADMIN_TOKEN")
+
+
+def _extract_request_token(authorization: Optional[str], x_dream_token: Optional[str]) -> Optional[str]:
+    if x_dream_token:
+        return x_dream_token.strip()
+    if authorization:
+        value = authorization.strip()
+        if value.lower().startswith("bearer "):
+            return value[7:].strip()
+        return value
+    return None
+
+
+def _constant_time_matches(actual: Optional[str], expected: Optional[str]) -> bool:
+    if not actual or not expected:
+        return False
+    return secrets.compare_digest(actual, expected)
+
+
+def require_api_token(
+    authorization: Optional[str] = Header(default=None),
+    x_dream_token: Optional[str] = Header(default=None),
+) -> None:
+    if not DREAM_API_TOKEN:
+        return
+    token = _extract_request_token(authorization, x_dream_token)
+    if _constant_time_matches(token, DREAM_API_TOKEN):
+        return
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def require_admin_token(
+    authorization: Optional[str] = Header(default=None),
+    x_dream_token: Optional[str] = Header(default=None),
+) -> None:
+    admin_token = DREAM_ADMIN_TOKEN or DREAM_API_TOKEN
+    if not admin_token:
+        return
+    token = _extract_request_token(authorization, x_dream_token)
+    if _constant_time_matches(token, admin_token):
+        return
+    raise HTTPException(status_code=403, detail="Forbidden")
 
 
 def model_dump(model: BaseModel) -> dict[str, Any]:
@@ -755,9 +801,13 @@ def build_manifest_payload(payload: AgentManifestIn) -> dict[str, Any]:
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    if not DREAM_API_TOKEN:
+        print("[dream_server] WARNING: DREAM_API_TOKEN is not set; API auth is effectively disabled.")
+    if not DREAM_ADMIN_TOKEN:
+        print("[dream_server] INFO: DREAM_ADMIN_TOKEN is not set; admin routes fall back to DREAM_API_TOKEN.")
 
 
-@app.post("/upsert_agent")
+@app.post("/upsert_agent", dependencies=[Depends(require_admin_token)])
 async def upsert_agent(payload: AgentUpsertIn):
     with db() as conn:
         existing = get_agent(conn, payload.name)
@@ -795,7 +845,7 @@ async def upsert_agent(payload: AgentUpsertIn):
         return {"ok": True, "agent": dict(row)}
 
 
-@app.get("/list_agents")
+@app.get("/list_agents", dependencies=[Depends(require_admin_token)])
 async def list_agents():
     with db() as conn:
         rows = [dict(row) for row in conn.execute("SELECT * FROM agents ORDER BY name")]
@@ -864,7 +914,7 @@ async def submit_manifest(payload: AgentManifestIn, request: Request):
     return {"ok": True, "manifest_id": manifest_id, "signature_valid": True}
 
 
-@app.post("/issue_challenge/{manifest_id}")
+@app.post("/issue_challenge/{manifest_id}", dependencies=[Depends(require_admin_token)])
 async def issue_challenge(manifest_id: int, request: Request):
     with db() as conn:
         manifest = conn.execute(
@@ -989,7 +1039,7 @@ async def respond_challenge(
     return {"ok": True, "verified": True}
 
 
-@app.post("/admit_manifest/{manifest_id}")
+@app.post("/admit_manifest/{manifest_id}", dependencies=[Depends(require_admin_token)])
 async def admit_manifest(
     manifest_id: int, payload: ManifestAdmissionIn, request: Request
 ):
@@ -1033,7 +1083,7 @@ async def admit_manifest(
     return {"ok": True}
 
 
-@app.get("/list_manifests")
+@app.get("/list_manifests", dependencies=[Depends(require_admin_token)])
 async def list_manifests():
     with db() as conn:
         rows = [
@@ -1051,7 +1101,7 @@ async def list_manifests():
     return {"ok": True, "results": rows}
 
 
-@app.post("/store_capsule")
+@app.post("/store_capsule", dependencies=[Depends(require_api_token)])
 async def store_capsule(payload: CapsuleIn, request: Request):
     record = build_capsule_record(payload)
     capsule_uuid = str(uuid.uuid4())
@@ -1132,7 +1182,7 @@ async def store_capsule(payload: CapsuleIn, request: Request):
     return {"ok": True, "capsule_id": capsule_id, "capsule_uuid": capsule_uuid}
 
 
-@app.post("/review_capsule/{capsule_id}")
+@app.post("/review_capsule/{capsule_id}", dependencies=[Depends(require_admin_token)])
 async def review_capsule(capsule_id: int, payload: ReviewCapsuleIn, request: Request):
     with db() as conn:
         row = conn.execute(
@@ -1182,7 +1232,7 @@ async def review_capsule(capsule_id: int, payload: ReviewCapsuleIn, request: Req
     return {"ok": True}
 
 
-@app.post("/quarantine_capsule/{capsule_id}")
+@app.post("/quarantine_capsule/{capsule_id}", dependencies=[Depends(require_admin_token)])
 async def quarantine_capsule(capsule_id: int, reviewer: str, request: Request):
     return await review_capsule(
         capsule_id,
@@ -1196,7 +1246,7 @@ async def quarantine_capsule(capsule_id: int, reviewer: str, request: Request):
     )
 
 
-@app.post("/import_capsule_bundle")
+@app.post("/import_capsule_bundle", dependencies=[Depends(require_api_token)])
 async def import_capsule_bundle(payload: CapsuleBundleIn, request: Request):
     bundle = payload.bundle
     if bundle.get("bundle_version") != BUNDLE_VERSION:
@@ -1389,7 +1439,7 @@ async def import_capsule_bundle(payload: CapsuleBundleIn, request: Request):
     }
 
 
-@app.get("/export_capsule/{capsule_id}")
+@app.get("/export_capsule/{capsule_id}", dependencies=[Depends(require_api_token)])
 async def export_capsule(capsule_id: int, sign_bundle: bool = True):
     with db() as conn:
         capsule = conn.execute(
@@ -1406,7 +1456,7 @@ async def export_capsule(capsule_id: int, sign_bundle: bool = True):
         return {"ok": True, "bundle": build_bundle(conn, capsule, sign_bundle)}
 
 
-@app.get("/get_capsule/{capsule_id}")
+@app.get("/get_capsule/{capsule_id}", dependencies=[Depends(require_api_token)])
 async def get_capsule(capsule_id: int, request: Request):
     with db() as conn:
         row = conn.execute(
@@ -1431,7 +1481,7 @@ async def get_capsule(capsule_id: int, request: Request):
         return serialize_capsule_row(row)
 
 
-@app.post("/search_capsules")
+@app.post("/search_capsules", dependencies=[Depends(require_api_token)])
 async def search_capsules(payload: SearchIn, request: Request):
     sql = """
         SELECT c.id, c.capsule_uuid, c.protocol_version, c.capsule_type, c.summary,
@@ -1477,7 +1527,7 @@ async def search_capsules(payload: SearchIn, request: Request):
     return {"ok": True, "results": rows}
 
 
-@app.post("/link_capsules")
+@app.post("/link_capsules", dependencies=[Depends(require_api_token)])
 async def link_capsules(payload: LinkIn, request: Request):
     with db() as conn:
         conn.execute(
@@ -1504,7 +1554,7 @@ async def link_capsules(payload: LinkIn, request: Request):
     return {"ok": True}
 
 
-@app.post("/recover_context")
+@app.post("/recover_context", dependencies=[Depends(require_api_token)])
 async def recover_context(payload: RecoverIn, request: Request):
     sql = """
         SELECT c.id, c.capsule_uuid, c.capsule_type, c.summary,
@@ -1540,7 +1590,7 @@ async def recover_context(payload: RecoverIn, request: Request):
     return {"ok": True, "recovered": rows}
 
 
-@app.post("/recover_hybrid_context")
+@app.post("/recover_hybrid_context", dependencies=[Depends(require_api_token)])
 async def recover_hybrid_context(payload: HybridRecoverIn, request: Request):
     local_result = await recover_context(
         RecoverIn(
@@ -1560,7 +1610,7 @@ async def recover_hybrid_context(payload: HybridRecoverIn, request: Request):
     }
 
 
-@app.get("/list_recent_capsules")
+@app.get("/list_recent_capsules", dependencies=[Depends(require_api_token)])
 async def list_recent_capsules(limit: int = 20):
     limit = max(1, min(limit, 200))
     with db() as conn:
@@ -1596,7 +1646,7 @@ async def root():
     }
 
 
-@app.get("/ancestry/{capsule_id}")
+@app.get("/ancestry/{capsule_id}", dependencies=[Depends(require_api_token)])
 async def ancestry(capsule_id: int):
     with db() as conn:
         capsule = conn.execute(
