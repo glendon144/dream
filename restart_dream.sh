@@ -2,6 +2,8 @@
 set -euo pipefail
 
 DREAM_DIR="${HOME}/dream"
+VENV_DIR="${HOME}/.venvs/dream"
+VENV_PYTHON="${VENV_DIR}/bin/python"
 LOG_DIR="${DREAM_DIR}/logs"
 SERVER_LOG="${LOG_DIR}/dream_server.log"
 MCP_LOG="${LOG_DIR}/dream_mcp.log"
@@ -18,12 +20,17 @@ else
   echo "Warning: ${DREAM_DIR}/.env not found"
 fi
 
+if [ ! -x "${VENV_PYTHON}" ]; then
+  echo "Dream venv python not found: ${VENV_PYTHON}"
+  exit 1
+fi
+
 echo "Stopping old Dream processes ..."
 "${DREAM_DIR}/stop_dream.sh" || true
 sleep 1
 
 echo "Starting Dream server ..."
-nohup python3 "${DREAM_DIR}/dream_server.py" >> "${SERVER_LOG}" 2>&1 &
+nohup "${VENV_PYTHON}" -m uvicorn dream_server:app --host 127.0.0.1 --port 8181 >> "${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
 
 sleep 2
@@ -36,7 +43,7 @@ fi
 echo "Dream server started with PID ${SERVER_PID}"
 
 echo "Starting Dream MCP server ..."
-nohup python3 "${DREAM_DIR}/dream_mcp_server.py" >> "${MCP_LOG}" 2>&1 &
+nohup "${VENV_PYTHON}" "${DREAM_DIR}/dream_mcp_server.py" >> "${MCP_LOG}" 2>&1 &
 MCP_PID=$!
 
 sleep 2

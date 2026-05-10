@@ -6,11 +6,10 @@ DREAM_DIR="${HOME}/dream"
 echo "Stopping Dream services from ${DREAM_DIR} ..."
 
 patterns=(
-  "${DREAM_DIR}/dream_server.py"
-  "${DREAM_DIR}/dream_mcp_server.py"
+  "uvicorn.*dream_server:app"
+  "dream_mcp_server.py"
   "python3 dream_server.py"
   "python dream_server.py"
-  "uvicorn dream_server:app"
   "python3 dream_mcp_server.py"
   "python dream_mcp_server.py"
 )
