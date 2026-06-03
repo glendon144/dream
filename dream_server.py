@@ -25,6 +25,7 @@ DB_PATH = BASE_DIR / "dream_capsules.db"
 SCHEMA_PATH = BASE_DIR / "schema.sql"
 PROTOCOL_VERSION = "dccp-1976-0.2"
 BUNDLE_VERSION = "dream-bundle-0.2"
+APP_VERSION = "0.3.0"
 DEFAULT_CHALLENGE_TTL_SECONDS = 600
 
 ALLOWED_CAPSULE_TYPES = {"distill", "transformation", "dream", "weave", "recovery"}
@@ -36,7 +37,7 @@ ALLOWED_AGENT_TIERS = {"local", "trusted", "federated", "admin", "quarantined"}
 ALLOWED_AGENT_STATUS = {"active", "pending", "restricted", "revoked"}
 ALLOWED_SIGNATURE_ALGORITHMS = {"hmac-sha256", "openssl-sha256"}
 
-app = FastAPI(title="Dream Capsule Server", version="0.3.0")
+app = FastAPI(title="Dream Capsule Server", version=APP_VERSION)
 
 
 DREAM_API_TOKEN = os.getenv("DREAM_API_TOKEN")
@@ -268,6 +269,34 @@ def default_recovery_query(capsule: dict[str, Any]) -> str:
     return text[:240]
 
 
+def build_server_status() -> dict[str, Any]:
+    with db() as conn:
+        capsule_count = conn.execute("SELECT COUNT(*) FROM capsules").fetchone()[0]
+        agent_count = conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0]
+        latest_capsule_created_at = conn.execute(
+            "SELECT MAX(created_at) FROM capsules"
+        ).fetchone()[0]
+
+    return {
+        "ok": True,
+        "service": "Dream Capsule Server",
+        "app_version": APP_VERSION,
+        "protocol_version": PROTOCOL_VERSION,
+        "bundle_version": BUNDLE_VERSION,
+        "db_path": str(DB_PATH),
+        "schema_path": str(SCHEMA_PATH),
+        "capsule_count": capsule_count,
+        "agent_count": agent_count,
+        "latest_capsule_created_at": latest_capsule_created_at,
+        "docs": "/docs",
+        "openapi": "/openapi.json",
+        "server_status": "/server_status",
+        "recent": "/list_recent_capsules",
+        "agents": "/list_agents",
+        "manifests": "/list_manifests",
+    }
+
+
 class DreamCapsuleBody(BaseModel):
     source_system: str
     source_references: List[str] = Field(default_factory=list)
@@ -442,10 +471,21 @@ class CapsuleBundleIn(BaseModel):
 
 def init_db() -> None:
     schema = SCHEMA_PATH.read_text(encoding="utf-8")
+    schema_lines = schema.splitlines()
+    schema_without_indexes = "\n".join(
+        line for line in schema_lines if not line.lstrip().startswith("CREATE INDEX ")
+    )
+    index_statements = [
+        line.strip()
+        for line in schema_lines
+        if line.lstrip().startswith("CREATE INDEX ")
+    ]
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("PRAGMA foreign_keys = ON")
-        conn.executescript(schema)
+        conn.executescript(schema_without_indexes)
         apply_migrations(conn)
+        for statement in index_statements:
+            conn.execute(statement)
         conn.commit()
 
 
@@ -1632,17 +1672,26 @@ async def list_recent_capsules(limit: int = 20):
     return {"ok": True, "results": rows}
 
 
+@app.get("/server_status")
+async def server_status():
+    return build_server_status()
+
+
 @app.get("/")
 async def root():
+    status = build_server_status()
     return {
-        "ok": True,
-        "service": "Dream Capsule Server",
-        "protocol_version": PROTOCOL_VERSION,
-        "bundle_version": BUNDLE_VERSION,
-        "docs": "/docs",
-        "recent": "/list_recent_capsules",
-        "agents": "/list_agents",
-        "manifests": "/list_manifests",
+        "ok": status["ok"],
+        "service": status["service"],
+        "app_version": status["app_version"],
+        "protocol_version": status["protocol_version"],
+        "bundle_version": status["bundle_version"],
+        "server_status": status["server_status"],
+        "docs": status["docs"],
+        "openapi": status["openapi"],
+        "recent": status["recent"],
+        "agents": status["agents"],
+        "manifests": status["manifests"],
     }
 
 
