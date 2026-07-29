@@ -52,6 +52,7 @@ DREAM_SSE_PORT  = int(os.getenv("DREAM_SSE_PORT", "8001"))
 DREAM_AGENT     = os.getenv("DREAM_AGENT_NAME", "claude-mcp")
 DREAM_API_TOKEN = os.getenv("DREAM_API_TOKEN")
 DREAM_ADMIN_TOKEN = os.getenv("DREAM_ADMIN_TOKEN")
+APP_VERSION = "0.3.0"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("dream_mcp")
@@ -373,7 +374,7 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
 
         # ── dream_server_status ────────────────────────────────────────────
         elif name == "dream_server_status":
-            data = await _get("/")
+            data = await _get("/server_status")
             return _ok(data)
 
         else:
@@ -404,7 +405,7 @@ async def run_stdio():
             write_stream,
             InitializationOptions(
                 server_name="dream-capsule-server",
-                server_version="0.3.0",
+                server_version=APP_VERSION,
                 capabilities=server.get_capabilities(
                     notification_options=NotificationOptions(),
                     experimental_capabilities={},
@@ -423,7 +424,7 @@ async def run_sse():
     sse = SseServerTransport("/messages/")
     init_options = InitializationOptions(
         server_name="dream-capsule-server",
-        server_version="0.3.0",
+        server_version=APP_VERSION,
         capabilities=server.get_capabilities(
             notification_options=NotificationOptions(),
             experimental_capabilities={},
